@@ -38,7 +38,6 @@ def patch_get_anki_client(mock_anki_client):
 
 def test_module_imports_and_registers_tools():
     """edit_tools must import cleanly and contribute its tools to the shared FastMCP instance."""
-    import mcp_ankiconnect.edit_tools  # noqa: F401
     from mcp_ankiconnect.edit_tools import (
         change_deck,
         inspect_cards,
@@ -102,7 +101,8 @@ async def test_inspect_cards_requires_exactly_one_of_card_ids_or_note_ids(
 ):
     result = await inspect_cards()
     assert result.startswith("SYSTEM_ERROR:")
-    assert "card_ids" in result and "note_ids" in result
+    assert "card_ids" in result
+    assert "note_ids" in result
     mock_anki_client.cards_info.assert_not_awaited()
 
     result_both = await inspect_cards(card_ids=[1], note_ids=[2])
@@ -252,7 +252,8 @@ async def test_update_note_fields_processes_content_and_invokes_client(
     assert note["fields"]["Front"] == "What is <code>x</code>?"
     assert note["fields"]["Back"] == "\\(x = 1\\)"
     assert "200" in result
-    assert "Front" in result and "Back" in result
+    assert "Front" in result
+    assert "Back" in result
 
 
 async def test_update_note_fields_api_error(mock_anki_client):
@@ -298,7 +299,8 @@ async def test_update_note_tags_add_only(mock_anki_client):
     )
     mock_anki_client.remove_tags.assert_not_awaited()
     assert "2 notes" in result
-    assert "physics" in result and "mechanics" in result
+    assert "physics" in result
+    assert "mechanics" in result
 
 
 async def test_update_note_tags_remove_only(mock_anki_client):

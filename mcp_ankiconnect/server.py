@@ -5,7 +5,7 @@ import random
 import re
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
@@ -150,55 +150,196 @@ def _build_example_query(deck: str | None, sample: str) -> str:
     return " ".join(query_parts)
 
 
+# --- Field cleaning helpers (Anki -> LLM direction) ---
+
+# Tags whose wrapping is pure presentation and should be removed entirely.
+# Inner text is kept; the tag boundaries vanish.
+_PRESENTATION_WRAPPER_RE = re.compile(
+    r"</?(?:div|span|font)\b[^>]*>",
+    flags=re.IGNORECASE,
+)
+
+# <br>, <br/>, <br /> in any spelling. Becomes a single space.
+_BR_RE = re.compile(r"<br\s*/?>", flags=re.IGNORECASE)
+
+# <img ...> with src="..." (or src='...') anywhere in the attributes.
+# Becomes "[image: <basename of src>]" so the LLM knows an image is there
+# without paying for the full HTML or learning a useless filename path.
+_IMG_RE = re.compile(
+    r"""<img\b[^>]*?\bsrc=["']([^"']+)["'][^>]*/?>""",
+    flags=re.IGNORECASE,
+)
+
+# style="..." / color="..." / align="..." attributes on otherwise-kept tags.
+# (Most styling is already stripped via the wrapper rule above; this catches
+# anything that snuck onto a kept tag like <b style="...">.)
+_NOISY_ATTR_RE = re.compile(
+    r'\s+(?:style|color|align)=("[^"]*"|\'[^\']*\')',
+    flags=re.IGNORECASE,
+)
+
+_ENTITY_REPLACEMENTS = (
+    ("&nbsp;", " "),
+    ("&amp;", "&"),
+    ("&lt;", "<"),
+    ("&gt;", ">"),
+    ("&quot;", '"'),
+)
+
+
+def _img_basename(src: str) -> str:
+    """Return the filename portion of an <img src> value (no URL path)."""
+    # Works for both URLs and bare filenames since rpartition handles "no /" cleanly.
+    return src.rpartition("/")[2] or src
+
+
+def _clean_field_html(content: Any) -> Any:
+    """Strip presentation noise from an Anki field, preserving meaning.
+
+    Removes: <div>/<span>/<font> wrappers, <br>, presentation attributes
+    (style/color/align), HTML entity codes. Replaces <img src="X"> with
+    "[image: X]" so the LLM knows an image exists without paying for the markup.
+
+    Keeps: <b>/<i>/<u>/<code>/<pre>/<sub>/<sup>, cloze markers ({{c1::...}}),
+    and any inline text.
+
+    Returns non-strings unchanged so the helper is safe to fold into existing
+    pipelines that may pass numeric IDs or None.
+    """
+    if not isinstance(content, str):
+        return content
+
+    # Image replacement first, before tag stripping eats the <img>. Surround
+    # the placeholder with spaces so back-to-back images don't fuse together;
+    # the whitespace-collapse step at the end normalizes the extra spaces.
+    result = _IMG_RE.sub(
+        lambda m: f" [image: {_img_basename(m.group(1))}] ",
+        content,
+    )
+    # Drop <br> as a soft separator.
+    result = _BR_RE.sub(" ", result)
+    # Drop presentation wrappers (div/span/font) — both opening and closing forms.
+    result = _PRESENTATION_WRAPPER_RE.sub("", result)
+    # Drop noisy attributes on whatever tags remain.
+    result = _NOISY_ATTR_RE.sub("", result)
+    # Existing simplification: <pre><code> ... </code></pre> -> <code>...</code>.
+    result = result.replace("<pre><code>", "<code>").replace("</code></pre>", "</code>")
+    # Decode common entities (no full HTML entity decoder dep needed).
+    for entity, replacement in _ENTITY_REPLACEMENTS:
+        result = result.replace(entity, replacement)
+    # Collapse whitespace.
+    result = re.sub(r"\s+", " ", result).strip()
+    return result
+
+
+def _is_image_occlusion_model(model_name: str) -> bool:
+    """Image Occlusion models pack ~10 fields of SVG mask references that are
+    pure noise to an LLM. We collapse them to a single placeholder.
+    """
+    return model_name.lower().startswith("image occlusion")
+
+
+def _format_note_clean(note: dict) -> dict:
+    """Format a notesInfo entry into a token-efficient shape for the LLM.
+
+    Drops fields whose cleaned value is empty. Special-cases Image Occlusion
+    notes by collapsing their many SVG-mask fields to a single placeholder.
+    """
+    model_name = note.get("modelName", "UnknownModel")
+
+    if _is_image_occlusion_model(model_name):
+        fields = {"Image": "[image-occlusion]"}
+    else:
+        fields = {}
+        for name, field_data in note.get("fields", {}).items():
+            cleaned = _clean_field_html(field_data.get("value", ""))
+            if cleaned:
+                fields[name] = cleaned
+
+    return {
+        "noteId": note.get("noteId"),
+        "modelName": model_name,
+        "fields": fields,
+        "tags": note.get("tags", []),
+    }
+
+
 def _format_example_notes(notes_info: list[dict]) -> list[dict]:
-    """Formats note information into simplified dictionaries for examples."""
+    """Format notes for `get_examples` — cleaned content, no noteId."""
     examples = []
     for note in notes_info:
-        processed_fields = {}
-        for name, field_data in note.get("fields", {}).items():
-            value = field_data.get("value", "")
-            processed_value = value.replace("<pre><code>", "<code>").replace(
-                "</code></pre>", "</code>"
-            )
-            processed_fields[name] = processed_value
-
-        example = {
-            "modelName": note.get("modelName", "UnknownModel"),
-            "fields": processed_fields,
-            "tags": note.get("tags", []),
-        }
-        examples.append(example)
+        cleaned = _format_note_clean(note)
+        examples.append(
+            {
+                "modelName": cleaned["modelName"],
+                "fields": cleaned["fields"],
+                "tags": cleaned["tags"],
+            }
+        )
     return examples
 
 
 def _format_search_results(notes_info: list[dict]) -> list[dict]:
-    """Formats note search results for LLM consumption.
+    """Format notes for `search_notes` with `return_card_content=True`.
 
-    Includes note IDs to enable follow-up actions like editing or deletion.
+    Includes noteId so follow-up actions (edit/inspect/delete) have an ID to
+    operate on.
+    """
+    return [_format_note_clean(note) for note in notes_info]
+
+
+def _format_search_previews(
+    notes_info: list[dict], preview_chars: int = 80
+) -> list[dict]:
+    """Format notes for `search_notes` default (no content) mode.
+
+    Each entry has noteId, modelName, tags, and a short cleaned preview of the
+    Front field (or first field by order) so the LLM can recognize what it
+    found without paying for full content. Image Occlusion notes get a
+    fixed `[image-occlusion]` preview.
     """
     results = []
     for note in notes_info:
-        processed_fields = {}
-        for name, field_data in note.get("fields", {}).items():
-            value = field_data.get("value", "")
-            # Clean up code formatting for readability
-            processed_value = value.replace("<pre><code>", "<code>").replace(
-                "</code></pre>", "</code>"
-            )
-            processed_fields[name] = processed_value
+        model_name = note.get("modelName", "UnknownModel")
+        if _is_image_occlusion_model(model_name):
+            preview = "[image-occlusion]"
+        else:
+            fields = note.get("fields", {})
+            front = fields.get("Front")
+            if front is None:
+                # Fall back to whichever field has order 0.
+                front = next(
+                    (
+                        f
+                        for f in fields.values()
+                        if isinstance(f, dict) and f.get("order") == 0
+                    ),
+                    None,
+                )
+            raw = front.get("value", "") if isinstance(front, dict) else ""
+            cleaned = _clean_field_html(raw)
+            if isinstance(cleaned, str) and len(cleaned) > preview_chars:
+                cleaned = cleaned[:preview_chars].rstrip() + "…"
+            preview = cleaned or ""
 
-        result = {
-            "noteId": note.get("noteId"),
-            "modelName": note.get("modelName", "UnknownModel"),
-            "fields": processed_fields,
-            "tags": note.get("tags", []),
-        }
-        results.append(result)
+        results.append(
+            {
+                "noteId": note.get("noteId"),
+                "modelName": model_name,
+                "tags": note.get("tags", []),
+                "preview": preview,
+            }
+        )
     return results
 
 
 def _format_cards_for_llm(cards_info: list[dict]) -> str:
-    """Formats card information into an XML-like string for the LLM."""
+    """Formats card information into an XML-like string for the LLM.
+
+    Field values pass through `_clean_field_html` first to strip presentation
+    HTML; fields that come out empty are skipped rather than emitted as empty
+    XML tags.
+    """
     formatted_cards = []
     for card in cards_info:
         card_id = card.get("cardId", "UNKNOWN_ID")
@@ -212,14 +353,16 @@ def _format_cards_for_llm(cards_info: list[dict]) -> str:
         )
 
         for name, field_data in sorted_field_items:
-            field_value = field_data.get("value", "")
+            cleaned_value = _clean_field_html(field_data.get("value", ""))
+            if not cleaned_value:
+                continue
             field_order = field_data.get("order", -1)
             tag_name = name.lower().replace(" ", "_")
 
             if field_order == question_field_order:
-                question_parts.append(f"<{tag_name}>{field_value}</{tag_name}>")
+                question_parts.append(f"<{tag_name}>{cleaned_value}</{tag_name}>")
             else:
-                answer_parts.append(f"<{tag_name}>{field_value}</{tag_name}>")
+                answer_parts.append(f"<{tag_name}>{cleaned_value}</{tag_name}>")
 
         question_str = (
             "".join(question_parts)
@@ -255,9 +398,11 @@ def _process_field_content(content: str) -> str:
     # 2. Code Blocks: ```lang\n...\n``` -> <pre><code class="language-lang">...</code></pre>
     processed_value = re.sub(
         r"```(\w+)?\s*\n?(.*?)```",
-        lambda m: f'<pre><code class="language-{m.group(1)}">{m.group(2)}</code></pre>'
-        if m.group(1)
-        else f"<pre><code>{m.group(2)}</code></pre>",
+        lambda m: (
+            f'<pre><code class="language-{m.group(1)}">{m.group(2)}</code></pre>'
+            if m.group(1)
+            else f"<pre><code>{m.group(2)}</code></pre>"
+        ),
         processed_value,
         flags=re.DOTALL,
     )
@@ -385,9 +530,9 @@ async def get_examples(
         # Format notes using the helper function
         formatted_examples = _format_example_notes(notes_info)
 
-        # Combine guidelines with the JSON examples
-        # Use json.dumps for clean formatting
-        examples_json = json.dumps(formatted_examples, indent=2, ensure_ascii=False)
+        # Combine guidelines with the JSON examples (compact JSON — pretty
+        # indentation roughly doubles whitespace bytes for no LLM benefit).
+        examples_json = json.dumps(formatted_examples, ensure_ascii=False)
         result = f"{flashcard_guidelines}\n\nHere are some examples based on your criteria:\n{examples_json}"
 
         return result
@@ -691,11 +836,31 @@ async def search_notes(
     limit: int = Field(
         default=20, ge=1, le=100, description="Maximum number of notes to return"
     ),
+    return_card_content: Annotated[
+        bool,
+        Field(
+            description=(
+                "If False (default), each result returns noteId/modelName/tags"
+                " plus a short cleaned preview of the Front field. If True,"
+                " each result returns cleaned, non-empty field content for the"
+                " whole note."
+            ),
+        ),
+    ] = False,
 ) -> str:
     """Search for notes in Anki using the powerful built-in search syntax.
 
     This tool allows you to find existing notes/flashcards using Anki's query language.
     Results include note IDs which can be used for follow-up actions.
+
+    Tiered access — call this first to narrow by query, then drill in by ID:
+    - Default (`return_card_content=False`): cheap response with noteId + a
+      ~80-char Front preview, so you can pick which IDs matter.
+    - `return_card_content=True`: full cleaned field content for every match.
+    - For scheduling/state details (queue, ease, interval, lapses, review
+      history) on specific IDs, call `inspect_cards(note_ids=[...])`. Pass
+      `properties=["fields"]` there if you also want the cleaned note content
+      alongside the per-card stats in one call.
 
     ## Common Search Patterns
 
@@ -751,9 +916,13 @@ async def search_notes(
     Args:
         query: The Anki search query string.
         limit: Maximum notes to return (1-100, default 20).
+        return_card_content: If True, returns full cleaned field content per
+            note. If False (default), returns a short Front preview per note.
 
     Returns:
-        JSON array of matching notes with their fields, tags, and note IDs.
+        JSON object with `query`, `total_found`, `returned`, and `notes`.
+        Each note has `noteId`, `modelName`, `tags`, and either `preview`
+        (default) or `fields` (when `return_card_content=True`).
     """
     async with get_anki_client() as anki:
         logger.debug(f"Searching notes with query: {query}")
@@ -769,7 +938,7 @@ async def search_notes(
                     "notes": [],
                     "message": "No notes found matching the query.",
                 },
-                indent=2,
+                ensure_ascii=False,
             )
 
         # Limit results
@@ -778,10 +947,13 @@ async def search_notes(
         # Fetch note details
         notes_info = await anki.notes_info(limited_note_ids)
 
-        # Format results
-        formatted_results = _format_search_results(notes_info)
+        # Format results — preview vs full content based on the tier flag.
+        if return_card_content:
+            formatted_results = _format_search_results(notes_info)
+        else:
+            formatted_results = _format_search_previews(notes_info)
 
-        result = {
+        result: dict[str, Any] = {
             "query": query,
             "total_found": len(note_ids),
             "returned": len(formatted_results),
@@ -793,4 +965,4 @@ async def search_notes(
                 f"Showing {limit} of {len(note_ids)} matching notes. Refine your query or increase limit for more results."
             )
 
-        return json.dumps(result, indent=2, ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False)

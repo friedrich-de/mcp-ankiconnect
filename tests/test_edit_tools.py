@@ -13,6 +13,7 @@ def mock_anki_client():
     mock = MagicMock(spec=AnkiConnectClient)
     mock.find_cards = AsyncMock()
     mock.cards_info = AsyncMock()
+    mock.notes_info = AsyncMock()
     mock.are_suspended = AsyncMock()
     mock.get_reviews_of_cards = AsyncMock()
     mock.update_note_fields = AsyncMock()
@@ -131,6 +132,7 @@ async def test_inspect_cards_by_card_ids_happy_path(mock_anki_client):
     result = await inspect_cards(card_ids=[100])
     payload = json.loads(result)
     card = payload["cards"][0]
+    # Default properties = identity + state + scheduling.
     assert card["cardId"] == 100
     assert card["noteId"] == 200
     assert card["deck"] == "Default"
@@ -141,9 +143,140 @@ async def test_inspect_cards_by_card_ids_happy_path(mock_anki_client):
     assert card["reps"] == 20
     assert card["lapses"] == 1
     assert card["raw_due"] == 365
-    assert card["reviews"] is None
-    assert card["last_review_iso"] is None
+    # timestamps / history / fields are opt-in and absent from default response.
+    assert "modified_iso" not in card
+    assert "reviews" not in card
+    assert "last_review_iso" not in card
+    assert "fields" not in card
     mock_anki_client.get_reviews_of_cards.assert_not_awaited()
+    mock_anki_client.notes_info.assert_not_awaited()
+
+
+async def test_inspect_cards_properties_all_includes_every_category(mock_anki_client):
+    mock_anki_client.cards_info.return_value = [
+        {
+            "cardId": 100,
+            "note": 200,
+            "deckName": "Default",
+            "modelName": "Basic",
+            "queue": 2,
+            "type": 2,
+            "factor": 2500,
+            "interval": 14,
+            "reps": 20,
+            "lapses": 1,
+            "due": 365,
+            "mod": 1730481234,
+        }
+    ]
+    mock_anki_client.are_suspended.return_value = [False]
+    mock_anki_client.get_reviews_of_cards.return_value = {
+        "100": [{"id": 1730481234567, "ease": 4, "ivl": 14, "time": 3000}]
+    }
+    mock_anki_client.notes_info.return_value = [
+        {
+            "noteId": 200,
+            "modelName": "Basic",
+            "tags": ["foo"],
+            "fields": {
+                "Front": {"value": "<div>Q1</div>", "order": 0},
+                "Back": {"value": "A1", "order": 1},
+            },
+        }
+    ]
+
+    result = await inspect_cards(card_ids=[100], properties=["all"])
+    card = json.loads(result)["cards"][0]
+    # Every category contributed something.
+    assert card["cardId"] == 100  # identity
+    assert card["queue_label"] == "review"  # state
+    assert card["ease"] == 2.5  # scheduling
+    assert card["modified_iso"].startswith("20")  # timestamps
+    assert len(card["reviews"]) == 1  # history
+    assert card["last_review_iso"] == card["reviews"][0]["reviewed_at_iso"]
+    assert card["fields"] == {"Front": "Q1", "Back": "A1"}  # fields, cleaned
+    mock_anki_client.notes_info.assert_awaited_once_with([200])
+
+
+async def test_inspect_cards_properties_subset_excludes_other_categories(
+    mock_anki_client,
+):
+    mock_anki_client.cards_info.return_value = [
+        {
+            "cardId": 100,
+            "note": 200,
+            "deckName": "D",
+            "modelName": "M",
+            "queue": 2,
+            "type": 2,
+            "factor": 2500,
+            "interval": 14,
+            "reps": 20,
+            "lapses": 1,
+            "due": 365,
+            "mod": 1730481234,
+        }
+    ]
+    mock_anki_client.are_suspended.return_value = [False]
+
+    result = await inspect_cards(card_ids=[100], properties=["identity"])
+    card = json.loads(result)["cards"][0]
+    assert set(card.keys()) == {"cardId", "noteId", "deck", "modelName"}
+    mock_anki_client.get_reviews_of_cards.assert_not_awaited()
+    mock_anki_client.notes_info.assert_not_awaited()
+
+
+async def test_inspect_cards_unknown_property_returns_error(mock_anki_client):
+    result = await inspect_cards(card_ids=[100], properties=["bogus"])
+    assert result.startswith("SYSTEM_ERROR:")
+    assert "bogus" in result
+    mock_anki_client.cards_info.assert_not_awaited()
+
+
+async def test_inspect_cards_fields_dedupes_notes_info_call(mock_anki_client):
+    """Two cards on the same note should trigger a single notes_info lookup."""
+    mock_anki_client.cards_info.return_value = [
+        {
+            "cardId": 100,
+            "note": 200,
+            "deckName": "D",
+            "modelName": "M",
+            "queue": 0,
+            "type": 0,
+            "factor": 0,
+            "interval": 0,
+            "reps": 0,
+            "lapses": 0,
+            "due": 0,
+            "mod": 0,
+        },
+        {
+            "cardId": 101,
+            "note": 200,
+            "deckName": "D",
+            "modelName": "M",
+            "queue": 0,
+            "type": 0,
+            "factor": 0,
+            "interval": 0,
+            "reps": 0,
+            "lapses": 0,
+            "due": 0,
+            "mod": 0,
+        },
+    ]
+    mock_anki_client.are_suspended.return_value = [False, False]
+    mock_anki_client.notes_info.return_value = [
+        {
+            "noteId": 200,
+            "modelName": "M",
+            "tags": [],
+            "fields": {"Front": {"value": "shared", "order": 0}},
+        }
+    ]
+
+    await inspect_cards(card_ids=[100, 101], properties=["identity", "fields"])
+    mock_anki_client.notes_info.assert_awaited_once_with([200])
 
 
 async def test_inspect_cards_by_note_ids_resolves_via_find_cards(mock_anki_client):

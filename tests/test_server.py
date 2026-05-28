@@ -191,8 +191,9 @@ async def test_get_examples_success(mock_anki_client):
     assert '"Back": "A1"' in result
     assert '"modelName": "Cloze"' in result
     assert '"Text": "Cloze {{c1::text}}"' in result
-    # Adjust assertion to account for json.dumps formatting with indentation
-    assert '"tags": [\n      "tag1"\n    ]' in result
+    # JSON is compact (no indent) — tags appear on the same line.
+    assert '"tags": ["tag1"]' in result
+    assert '"tags": ["tag2"]' in result
 
 
 @pytest.mark.asyncio
@@ -909,8 +910,8 @@ def test__format_cards_for_llm():
 
 # --- search_notes ---
 @pytest.mark.asyncio
-async def test_search_notes_success(mock_anki_client):
-    """Test search_notes success path with results."""
+async def test_search_notes_default_returns_id_and_preview(mock_anki_client):
+    """Default mode returns noteId + Front preview, not full field content."""
     mock_anki_client.find_notes.return_value = [101, 102, 103]
     mock_anki_client.notes_info.return_value = [
         {
@@ -944,7 +945,6 @@ async def test_search_notes_success(mock_anki_client):
     mock_anki_client.find_notes.assert_called_once_with(query="deck:Spanish")
     mock_anki_client.notes_info.assert_called_once_with([101, 102, 103])
 
-    # Check the JSON response structure
     import json
 
     result_data = json.loads(result)
@@ -953,13 +953,92 @@ async def test_search_notes_success(mock_anki_client):
     assert result_data["returned"] == 3
     assert len(result_data["notes"]) == 3
 
-    # Check first note structure
     first_note = result_data["notes"][0]
     assert first_note["noteId"] == 101
     assert first_note["modelName"] == "Basic"
     assert first_note["tags"] == ["spanish", "vocab"]
-    assert first_note["fields"]["Front"] == "hola"
-    assert first_note["fields"]["Back"] == "hello"
+    # Default mode: preview field instead of full fields dict.
+    assert first_note["preview"] == "hola"
+    assert "fields" not in first_note
+    # Cloze without a Front field falls back to first-order field.
+    cloze_note = result_data["notes"][2]
+    assert cloze_note["preview"] == "{{c1::gracias}} means thanks"
+
+
+@pytest.mark.asyncio
+async def test_search_notes_with_content_returns_cleaned_fields(mock_anki_client):
+    """return_card_content=True returns cleaned fields, no preview."""
+    mock_anki_client.find_notes.return_value = [101]
+    mock_anki_client.notes_info.return_value = [
+        {
+            "noteId": 101,
+            "modelName": "Basic",
+            "tags": ["spanish", "vocab"],
+            "fields": {
+                "Front": {"value": "<div>hola</div>", "order": 0},
+                "Back": {"value": "hello", "order": 1},
+                "Explanation": {"value": "", "order": 2},
+            },
+        },
+    ]
+
+    result = await search_notes(
+        query="deck:Spanish", limit=10, return_card_content=True
+    )
+
+    import json
+
+    note = json.loads(result)["notes"][0]
+    assert note["fields"] == {"Front": "hola", "Back": "hello"}
+    assert "Explanation" not in note["fields"]
+    assert "preview" not in note
+
+
+@pytest.mark.asyncio
+async def test_search_notes_image_occlusion_preview_is_placeholder(mock_anki_client):
+    """Image Occlusion notes get a fixed `[image-occlusion]` preview rather than
+    pretending the Front field has anything readable in it."""
+    mock_anki_client.find_notes.return_value = [101]
+    mock_anki_client.notes_info.return_value = [
+        {
+            "noteId": 101,
+            "modelName": "Image Occlusion Enhanced",
+            "tags": [],
+            "fields": {
+                "Image": {"value": '<img src="x.jpg">', "order": 2},
+                "Question Mask": {
+                    "value": '<img src="x-Q.svg">',
+                    "order": 3,
+                },
+            },
+        }
+    ]
+
+    import json
+
+    note = json.loads(await search_notes(query="*", limit=10))["notes"][0]
+    assert note["preview"] == "[image-occlusion]"
+
+
+@pytest.mark.asyncio
+async def test_search_notes_preview_truncates_long_front(mock_anki_client):
+    """Long Front content gets truncated with an ellipsis."""
+    long_front = "x" * 200
+    mock_anki_client.find_notes.return_value = [101]
+    mock_anki_client.notes_info.return_value = [
+        {
+            "noteId": 101,
+            "modelName": "Basic",
+            "tags": [],
+            "fields": {"Front": {"value": long_front, "order": 0}},
+        }
+    ]
+
+    import json
+
+    note = json.loads(await search_notes(query="*", limit=10))["notes"][0]
+    assert note["preview"].endswith("…")
+    assert len(note["preview"]) <= 81  # 80 chars + ellipsis
 
 
 @pytest.mark.asyncio

@@ -9,9 +9,10 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from mcp_ankiconnect.server import (
+    _format_note_clean,
     _process_field_content,
     get_anki_client,
     handle_anki_connection_error,
@@ -34,6 +35,21 @@ _QUEUE_LABELS = {
 }
 
 _EASE_LABELS = {1: "again", 2: "hard", 3: "good", 4: "easy"}
+
+# Property categories for `inspect_cards`. The default omits anything that
+# would force an extra round trip (`fields`, `history`) or whose
+# interpretation is queue-dependent and therefore noisy by default
+# (`timestamps`). The agent opts in to those explicitly.
+_INSPECT_DEFAULT_PROPERTIES: tuple[str, ...] = ("identity", "state", "scheduling")
+_INSPECT_ALL_PROPERTIES: tuple[str, ...] = (
+    "identity",
+    "state",
+    "scheduling",
+    "timestamps",
+    "history",
+    "fields",
+)
+_INSPECT_VALID_PROPERTIES: frozenset[str] = frozenset((*_INSPECT_ALL_PROPERTIES, "all"))
 
 
 def _queue_label(queue: int) -> str:
@@ -59,31 +75,65 @@ def _format_review_entry(entry: dict) -> dict:
 async def inspect_cards(
     card_ids: list[int] | None = None,
     note_ids: list[int] | None = None,
+    properties: list[str] | None = None,
     include_history: bool = False,
 ) -> str:
-    """Inspect per-card state: deck, model, suspension, ease, scheduling, optional review history.
+    """Inspect per-card state with sparse fieldset selection.
 
-    Provide EXACTLY ONE of `card_ids` or `note_ids`. When `note_ids` is given, the tool
-    resolves to all cards belonging to those notes via an `nid:` query.
+    Provide EXACTLY ONE of `card_ids` or `note_ids`. When `note_ids` is given,
+    the tool resolves to all cards belonging to those notes via an `nid:` query.
 
-    Returned JSON contains a `cards` array. Each entry includes raw `queue`, `type`, and
-    `raw_due` from AnkiConnect (interpretation depends on queue), plus a derived
-    `queue_label` ("new"/"learn"/"review"/"day_learn"/"suspended"/"buried_sched"/"buried_user").
+    Use `properties` to pick which categories of information to return. The
+    default keeps responses small; opt into the heavier categories explicitly.
 
-    Set `include_history=True` to fetch each card's review log (extra AnkiConnect call).
-    Each review entry has an ISO timestamp, an "again"/"hard"/"good"/"easy" rating,
-    interval in days, and time taken in ms.
+    Property categories:
+      - `identity` — cardId, noteId, deck, modelName
+      - `state` — suspended, queue, queue_label, type
+      - `scheduling` — ease, interval, reps, lapses, raw_due
+      - `timestamps` — modified_iso, last_review_iso (the latter only with `history`)
+      - `history` — full review log (extra AnkiConnect call). Each entry has
+        an ISO timestamp, an "again"/"hard"/"good"/"easy" rating, interval in
+        days, and time taken in ms.
+      - `fields` — cleaned, non-empty note field content (extra `notesInfo`
+        round trip). Image Occlusion notes collapse to a single placeholder.
+      - `all` — shorthand for every category above.
+
+    Default when `properties` is None: `["identity", "state", "scheduling"]`.
+
+    `include_history=True` is kept as a soft-deprecated alias — equivalent to
+    adding `"history"` to `properties`. Prefer the new param going forward.
 
     Args:
         card_ids: List of card IDs to inspect.
         note_ids: List of note IDs; expands to every card on those notes.
-        include_history: If True, attach per-card review history.
+        properties: List of property categories to include.
+        include_history: Soft-deprecated alias for `properties=["history", ...]`.
     """
     if (card_ids is None) == (note_ids is None):
         return (
             "SYSTEM_ERROR: Provide exactly one of `card_ids` or `note_ids` "
             "(not both, not neither)."
         )
+
+    if properties is None:
+        resolved_properties = set(_INSPECT_DEFAULT_PROPERTIES)
+    else:
+        unknown = [p for p in properties if p not in _INSPECT_VALID_PROPERTIES]
+        if unknown:
+            return (
+                "SYSTEM_ERROR: Unknown property categories: "
+                f"{unknown}. Valid options: {sorted(_INSPECT_VALID_PROPERTIES)}."
+            )
+        if "all" in properties:
+            resolved_properties = set(_INSPECT_ALL_PROPERTIES)
+        else:
+            resolved_properties = set(properties)
+    if include_history:
+        # Match the legacy shape: the old `include_history=True` populated
+        # both the review log AND `last_review_iso`, so the alias pulls in
+        # `timestamps` too.
+        resolved_properties.add("history")
+        resolved_properties.add("timestamps")
 
     async with get_anki_client() as anki:
         if note_ids is not None:
@@ -92,7 +142,7 @@ async def inspect_cards(
             nid_query = "nid:" + ",".join(str(n) for n in note_ids)
             resolved_card_ids = await anki.find_cards(query=nid_query)
             if not resolved_card_ids:
-                return json.dumps({"cards": []}, indent=2)
+                return json.dumps({"cards": []})
         else:
             if not card_ids:
                 return "SYSTEM_ERROR: `card_ids` must not be empty."
@@ -102,44 +152,67 @@ async def inspect_cards(
         suspended_flags = await anki.are_suspended(cards=resolved_card_ids)
 
         reviews_by_card: dict[str, list[dict]] = {}
-        if include_history:
+        if "history" in resolved_properties:
             reviews_by_card = await anki.get_reviews_of_cards(cards=resolved_card_ids)
+
+        field_lookup: dict[int, dict[str, str]] = {}
+        if "fields" in resolved_properties:
+            unique_nids = list(
+                {card["note"] for card in cards_info if card.get("note") is not None}
+            )
+            if unique_nids:
+                notes_data = await anki.notes_info(unique_nids)
+                for note in notes_data:
+                    nid = note.get("noteId")
+                    if nid is not None:
+                        field_lookup[nid] = _format_note_clean(note)["fields"]
 
         out_cards = []
         for card, suspended in zip(cards_info, suspended_flags, strict=False):
             cid = card.get("cardId")
-            entry = {
-                "cardId": cid,
-                "noteId": card.get("note"),
-                "deck": card.get("deckName"),
-                "modelName": card.get("modelName"),
-                "suspended": bool(suspended) if suspended is not None else None,
-                "queue": card.get("queue"),
-                "queue_label": _queue_label(card.get("queue", 0)),
-                "type": card.get("type"),
-                "ease": (card.get("factor", 0) or 0) / 1000.0,
-                "interval": card.get("interval"),
-                "reps": card.get("reps"),
-                "lapses": card.get("lapses"),
-                "raw_due": card.get("due"),
-                "modified_iso": datetime.fromtimestamp(
-                    card.get("mod", 0), tz=UTC
-                ).isoformat()
-                if card.get("mod")
-                else None,
-                "reviews": None,
-                "last_review_iso": None,
-            }
-            if include_history:
+            entry: dict[str, Any] = {}
+
+            if "identity" in resolved_properties:
+                entry["cardId"] = cid
+                entry["noteId"] = card.get("note")
+                entry["deck"] = card.get("deckName")
+                entry["modelName"] = card.get("modelName")
+
+            if "state" in resolved_properties:
+                entry["suspended"] = bool(suspended) if suspended is not None else None
+                entry["queue"] = card.get("queue")
+                entry["queue_label"] = _queue_label(card.get("queue", 0))
+                entry["type"] = card.get("type")
+
+            if "scheduling" in resolved_properties:
+                entry["ease"] = (card.get("factor", 0) or 0) / 1000.0
+                entry["interval"] = card.get("interval")
+                entry["reps"] = card.get("reps")
+                entry["lapses"] = card.get("lapses")
+                entry["raw_due"] = card.get("due")
+
+            if "timestamps" in resolved_properties:
+                entry["modified_iso"] = (
+                    datetime.fromtimestamp(card.get("mod", 0), tz=UTC).isoformat()
+                    if card.get("mod")
+                    else None
+                )
+
+            if "history" in resolved_properties:
                 raw_reviews = reviews_by_card.get(str(cid), [])
                 formatted = [_format_review_entry(r) for r in raw_reviews]
                 entry["reviews"] = formatted
-                entry["last_review_iso"] = (
-                    formatted[-1]["reviewed_at_iso"] if formatted else None
-                )
+                last_iso = formatted[-1]["reviewed_at_iso"] if formatted else None
+                if "timestamps" in resolved_properties:
+                    entry["last_review_iso"] = last_iso
+
+            if "fields" in resolved_properties:
+                nid = card.get("note")
+                entry["fields"] = field_lookup.get(nid, {}) if nid is not None else {}
+
             out_cards.append(entry)
 
-        return json.dumps({"cards": out_cards}, indent=2, ensure_ascii=False)
+        return json.dumps({"cards": out_cards}, ensure_ascii=False)
 
 
 @mcp.tool()

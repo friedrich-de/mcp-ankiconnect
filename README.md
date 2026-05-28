@@ -23,7 +23,8 @@ The server implements the following tools:
   - Ratings: "wrong", "hard", "good", "easy"
   - Returns confirmation of submitted reviews
 
-- `inspect_cards`: View per-card state (suspension, ease, interval, scheduling, optional review history) for given card IDs or note IDs.
+- `search_notes`: Find notes by AnkiConnect query. Returns IDs + a short Front preview by default (cheap); pass `return_card_content=true` to receive cleaned field content inline.
+- `inspect_cards`: View per-card state for given card IDs or note IDs. Sparse-fieldset selection via the `properties` list: any of `identity`, `state`, `scheduling`, `timestamps`, `history`, `fields`, or `all` (default: `["identity", "state", "scheduling"]`). The legacy `include_history=true` flag is still accepted as an alias.
 - `update_note_fields`: Modify the text content of one note's fields. Uses the same MathJax/code conversions as `add_note`.
 - `update_note_tags`: Add and/or remove tags on one or more notes.
 - `set_suspended`: Suspend or unsuspend one or more cards.

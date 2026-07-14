@@ -71,6 +71,21 @@ The server implements the following tools:
 
 3. Restart Anki and Claude desktop
 
+### ChatGPT with OpenAI Secure MCP Tunnel
+
+The standalone server can connect to ChatGPT without exposing a public port.
+Set the tunnel environment variables and start the normal entry point:
+
+```bash
+export OPENAI_SECURE_TUNNEL_ENABLED=true
+export CONTROL_PLANE_TUNNEL_ID=tunnel_0123456789abcdef0123456789abcdef
+export CONTROL_PLANE_API_KEY=sk-...
+uv run mcp-ankiconnect
+```
+
+When tunnel mode is disabled or unset, `mcp-ankiconnect` continues to use stdio
+as before.
+
 ### Debugging
 
 Since MCP servers run over stdio, debugging can be challenging. For the best debugging

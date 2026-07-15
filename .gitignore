@@ -13,3 +13,8 @@ wheels/
 
 # DS Store
 .DS_Store
+
+# Anki's local meta.json plus preserved runtimes, downloads, caches, and logs
+anki_addon/meta.json
+anki_addon/user_files/*
+!anki_addon/user_files/README.txt

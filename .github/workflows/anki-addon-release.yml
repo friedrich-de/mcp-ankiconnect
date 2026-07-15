@@ -1,0 +1,47 @@
+name: Publish Anki add-on
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Anki add-on
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          stage="$(mktemp -d)"
+          archive="$GITHUB_WORKSPACE/dist/mcpankiconnect-$version.ankiaddon"
+          trap 'rm -rf "$stage"' EXIT
+
+          mkdir -p "$stage/mcp_ankiconnect" "$stage/user_files" dist
+          rm -f "$archive"
+          cp anki_addon/{__init__.py,config.json,config.md,launcher.py,manifest.json} "$stage/"
+          cp anki_addon/user_files/README.txt "$stage/user_files/"
+          cp pyproject.toml README.md "$stage/"
+          cp mcp_ankiconnect/*.py "$stage/mcp_ankiconnect/"
+
+          (
+            cd "$stage"
+            zip -qr "$archive" *
+          )
+
+      - name: Replace GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete "$GITHUB_REF_NAME" --yes || true
+          gh release create "$GITHUB_REF_NAME" dist/*.ankiaddon \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

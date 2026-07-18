@@ -1,5 +1,9 @@
 # mcp-ankiconnect MCP server
 
+> **Looking for a headless AnkiConnect server with MCP?** Use
+> [friedrich-de/anki-connect-server](https://github.com/friedrich-de/anki-connect-server)
+> instead. This project runs MCP locally as an Anki add-on.
+
 Connect ChatGPT or Claude conversations with AnkiConnect via MCP to make spaced
 repetition as easy as "Let's go through today's flashcards" or "Make flashcards
 for this."
